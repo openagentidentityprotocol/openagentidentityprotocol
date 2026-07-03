@@ -1,0 +1,200 @@
+---
+title: "Cascade Revocation for Agent Delegation Chains"
+description: "Proposal for propagating revocation through agent delegation trees"
+---
+
+## Problem
+
+When agents delegate authority to other agents, revocation must propagate. If Agent A delegates to Agent B, and B sub-delegates to C, revoking A→B must also invalidate C's authority. Without cascade revocation, revoking a compromised agent leaves its downstream delegations active.
+
+In multi-agent systems where agents autonomously sub-delegate to specialists, a single compromised delegation can create an unbounded tree of active permissions that the human principal cannot recall.
+
+## Data Structures
+
+All data structures are defined in [cascade-revocation.schema.json](/spec/schema/cascade-revocation.schema.json).
+
+The core objects are:
+
+- **Delegation** — authority granted from one agent to another, with scope, spend limit, depth limit, and expiry
+- **RevocationRecord** — signed evidence that one delegation was revoked. Carries `revokedBy`, an issuer-signed `revokedAt`, a machine-readable `reasonCode` with optional freetext `detail`, the cascade `transactionId`, `cascadeOrigin` on cascade-derived records, `cascadeCount`, and an optional `evidenceRef`
+- **CascadeCompletionRecord** — signed evidence that a cascade transaction closed, emitted once per `transactionId` after the last descendant's revocation persists
+- **ChainRegistry** — parent-child index populated at delegation creation time (not reconstructed at revocation time)
+- **RevocationEvent** — event emitted for each revoked delegation in a cascade
+
+The `parentDelegationId` field uses `string | null` (not optional). Root delegations set this to `null` explicitly. This aligns with the ChainRegistry.parents map behavior.
+
+## State vs Evidence
+
+The design keeps two concerns separate, and a conforming implementation MUST NOT collapse them into a single mutable lookup:
+
+- **State (current validity)** — held in the `ChainRegistry` and each `Delegation.revoked` flag. It answers "is this delegation valid right now?" as a fast, mutable index.
+- **Evidence (revocation history)** — held in the signed `RevocationRecord` and `CascadeCompletionRecord` objects. It answers "was this revoked, by whom, when, and under which cascade?" as immutable, independently verifiable records.
+
+A validator MUST be able to answer both of the following questions, and neither answer may depend on the other's data source:
+
+1. **Current validity.** Answerable from state alone (`ChainRegistry` plus `Delegation.revoked`), without reading any signed record.
+2. **Revocation history.** Answerable from the signed records alone (`RevocationRecord` plus `CascadeCompletionRecord`), without trusting mutable state.
+
+If an implementation reduces question 2 to a mutable state lookup, it fails conformance. Revocation history would then be only as trustworthy as the current state store, so a tampered or rolled-back index would silently erase the evidence trail.
+
+## Algorithm
+
+### Cascade Revocation
+
+When a delegation is revoked, all downstream delegations MUST be revoked synchronously.
+
+```
+# Entry point. Allocates the transaction and emits the completion record.
+revokeWithCascade(rootDelegationId, reasonCode, detail, revokerKey):
+  1. transactionId = new UUID
+  2. revoked = cascadeRevoke(rootDelegationId, reasonCode, detail, revokerKey,
+                             transactionId, cascadeOrigin=null)
+  3. If revoked is empty (the root was already revoked, so this call is an
+     idempotent no-op): return (revoked, null). Nothing was revoked, so there
+     is no transaction to close and NO CascadeCompletionRecord is emitted.
+  4. After every RevocationRecord in `revoked` has durably persisted, emit a signed
+     CascadeCompletionRecord {
+       transactionId, rootDelegationId,
+       revokedBy=revokerKey, completedAt=now,
+       totalRevoked=len(revoked),               # >= 1, since revoked is non-empty here
+       revokedDelegationIds=[r.delegationId for r in revoked]
+     }
+  5. Return (revoked, CascadeCompletionRecord)
+
+cascadeRevoke(delegationId, reasonCode, detail, revokerKey, transactionId, cascadeOrigin):
+  1. Look up delegation in store by delegationId
+  2. If already revoked, return [] (idempotent: no re-emit, no count change)
+  3. Mark delegation as revoked (revoked=true, revokedAt=now) in state
+  4. descendants = []
+     For each childId in chainRegistry.children[delegationId]:
+       # descendants inherit reasonCode=parent_revoked and the same transactionId + origin
+       descendants += cascadeRevoke(childId, "parent_revoked", detail, revokerKey,
+                                    transactionId, cascadeOrigin = cascadeOrigin or delegationId)
+  5. Sign RevocationRecord {
+       delegationId, revokedBy=revokerKey, revokedAt,
+       reasonCode, detail?, transactionId,
+       cascadeOrigin,                 # null on the root, root delegationId on descendants
+       cascadeCount=len(descendants), evidenceRef?
+     } with revokerKey
+  6. Emit revocation event
+  7. Return [thisRecord] + descendants
+```
+
+**Properties:**
+- **Synchronous** — all descendants revoked in the same operation. No eventual consistency.
+- **Deterministic** — same input always produces the same result.
+- **Idempotent** — revoking an already-revoked delegation is a no-op.
+- **Total (Transactional)** — no partial cascade. Either all descendants are revoked and their revocation records durably persisted, or none are. Implementations MUST execute steps 3-7 for the entire cascade within a single atomic transaction or equivalent mechanism that guarantees all-or-nothing visibility. In systems without multi-record transactions, implementations MUST document that cascade is best-effort and may leave partial state on failure.
+
+### Cascade Completion
+
+Mode (Total versus best-effort) states what an implementation promises. It does not state what a specific cascade did. To make that observable from the records alone, every cascade emits a signed `CascadeCompletionRecord` after its last descendant's `RevocationRecord` durably persists:
+
+- A validator that sees a `CascadeCompletionRecord` for `transactionId` T MAY treat the subtree rooted at `rootDelegationId` as fully closed.
+- A validator that sees `RevocationRecord`s carrying `transactionId` T but no matching `CascadeCompletionRecord` MUST treat the cascade as in progress or failed, never as closed.
+
+This turns the failure case, a partially revoked subtree read as closed, into a detectable condition rather than an assumption. `totalRevoked` and `revokedDelegationIds` let a validator cross-check that the count and identity of persisted `RevocationRecord`s match what the completion record claims.
+
+### Batch Revocation by Agent
+
+Revoke all delegations granted TO a specific agent, with cascade.
+
+```
+batchRevokeByAgent(agentId, reasonCode, detail, revokerKey):
+  1. Find all delegations where delegateId == agentId
+  2. results = []
+     For each delegation:
+       # Each root is its own cascade transaction: revokeWithCascade allocates a
+       # transactionId and emits a CascadeCompletionRecord per root. A delegation
+       # already killed by an earlier root in this batch returns ([], null) and is
+       # skipped, so no empty completion record is emitted.
+       (records, completion) = revokeWithCascade(delegation.delegationId,
+                                                 reasonCode, detail, revokerKey)
+       if records is non-empty:
+         results += [(records, completion)]
+  3. Return results
+```
+
+Use case: an agent is compromised. The principal revokes everything granted to that agent. All sub-delegations also die.
+
+### Chain Validation
+
+Before any action is permitted, the entire delegation chain back to the principal MUST be validated.
+
+```
+validateChain(delegationIds[]):
+  0. Resolve delegations from registry:
+     - For each delegationId in delegationIds (in order provided):
+       - Lookup delegation in registry by delegationId
+       - If not found: return invalid ("unknown delegation")
+       - Append to orderedDelegations[]
+  1. For each delegation in orderedDelegations:
+     - If revoked: return invalid
+     - If expired: return invalid
+  2. For each adjacent pair (parent, child) in orderedDelegations:
+     - If parent.delegationId != child.parentDelegationId: return invalid ("invalid parent reference")
+     - If parent.delegateId != child.delegatorId: return invalid ("chain break")
+  3. Return valid
+```
+
+## Sub-delegation Constraints
+
+When an agent sub-delegates, the child MUST be strictly narrower than the parent:
+
+- **Scope** — child scope MUST be a subset of parent scope. For array-valued scopes: for each `requiredScope` in the child's scope array, there MUST exist some `grantedScope` in the parent's scope array such that `scopeCovers(grantedScope, requiredScope)` is true, where `scopeCovers` operates on individual scope strings.
+- **Spend limit** — child MUST NOT exceed parent spend limit. Currency is explicit (ISO 4217) or inherited from protocol default.
+- **Depth** — child currentDepth MUST equal parent currentDepth + 1, MUST NOT exceed parent maxDepth
+- **Expiry** — child MUST NOT exceed parent expiration
+
+Violation of any constraint MUST cause sub-delegation to fail.
+
+## Security Properties
+
+| Property | Requirement |
+|----------|------------|
+| No orphan delegations | Every non-root delegation MUST have a traceable parent |
+| Idempotent revocation | Double-revoke MUST NOT re-emit events or increment counts |
+| Irreversible | Revoked delegations CANNOT be un-revoked |
+| Branching | Cascade MUST traverse all branches of multi-child delegations |
+| Event propagation | Implementations SHOULD support revocation event subscriptions |
+
+## Integration with Policy Engines
+
+Cascade revocation is an identity-layer primitive. Policy engines (such as AIP's AgentPolicy) SHOULD reference delegation chain validity as a precondition for policy evaluation.
+
+```
+1. Agent presents action request with delegationId
+2. Policy engine calls validateChain() on the delegation chain
+3. If chain invalid (any link revoked/expired), deny immediately
+4. If chain valid, proceed to policy evaluation
+```
+
+This ensures revocation takes effect immediately without requiring policy engines to maintain their own revocation state.
+
+## Adversarial Scenarios
+
+Any conforming implementation MUST mitigate the following:
+
+| Attack | Mitigation |
+|--------|-----------|
+| Replay revoked delegation | Chain validation checks revoked flag before any action |
+| Sub-delegate after revocation | Sub-delegation checks delegation validity |
+| Scope escalation via sub-delegation | Strict scope narrowing enforced |
+| Spend limit escalation | Child spend limit capped at parent |
+| Depth bomb (unbounded sub-delegation) | maxDepth enforced at sub-delegation time |
+| Double-revoke event spam | Idempotent revocation |
+| Orphan delegation after parent delete | Cascade revocation before deletion |
+
+## Scope Resolution
+
+Cascade revocation depends on correct scope matching. All implementations MUST use a single scope matching function:
+
+- Exact match: `code` covers `code`
+- Hierarchical: `code` covers `code:deploy`
+- Universal wildcard: `*` covers everything
+- Prefix wildcard: `commerce:*` covers `commerce` and `commerce:checkout`
+- No reverse: `code:deploy` does NOT cover `code`
+
+## Conformance Vectors
+
+Canonical-JSON test vectors for these structures live in [spec/conformance/cascade-revocation/vectors.json](/spec/conformance/cascade-revocation/vectors.json). Each vector pairs a structured `object` with the exact canonical-JSON bytes a conforming serializer MUST produce (RFC 8785 JCS: object keys sorted by code unit, no insignificant whitespace, UTF-8, integers with no exponent or fraction), plus the `signingInput` bytes (the same object with `signature` omitted) that the Ed25519 signature is computed over. This lets TypeScript and Python implementations assert byte-parity on both the wire form and the signing preimage. The set covers a root `Delegation`, a root `RevocationRecord`, a cascade-derived `RevocationRecord` (`reasonCode: parent_revoked` with `cascadeOrigin`), and the matching `CascadeCompletionRecord`.

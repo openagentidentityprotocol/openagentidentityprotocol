@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aip.io/schema/proposals/cascade-revocation.schema.json",
+  "title": "Cascade Revocation",
+  "description": "Data structures for cascade revocation in agent delegation chains",
+  "type": "object",
+  "$defs": {
+    "Delegation": {
+      "type": "object",
+      "description": "A delegation of authority from one agent to another",
+      "required": ["delegationId", "delegatorId", "delegateId", "scope", "maxDepth", "currentDepth", "expiresAt", "createdAt", "parentDelegationId", "revoked", "signature"],
+      "additionalProperties": false,
+      "properties": {
+        "delegationId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Unique identifier (UUID v4)"
+        },
+        "delegatorId": {
+          "type": "string",
+          "description": "Agent granting authority"
+        },
+        "delegateId": {
+          "type": "string",
+          "description": "Agent receiving authority"
+        },
+        "scope": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Permitted action scopes"
+        },
+        "currency": {
+          "type": "string",
+          "description": "Delegation currency (ISO 4217 code, e.g. 'USD'). If omitted, protocol default applies"
+        },
+        "spendLimit": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Maximum spend in smallest unit of currency (e.g. cents). If omitted, no spend constraint"
+        },
+        "maxDepth": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum sub-delegation depth allowed"
+        },
+        "currentDepth": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Current depth in the chain (0 = root)"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 expiration timestamp"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 creation timestamp"
+        },
+        "parentDelegationId": {
+          "oneOf": [
+            { "type": "string", "format": "uuid" },
+            { "type": "null" }
+          ],
+          "description": "ID of parent delegation (null for root)"
+        },
+        "revoked": {
+          "type": "boolean",
+          "default": false,
+          "description": "Revocation status"
+        },
+        "revokedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 revocation timestamp"
+        },
+        "revokedReason": {
+          "type": "string",
+          "description": "Human-readable revocation reason"
+        },
+        "signature": {
+          "type": "string",
+          "description": "Ed25519 signature by delegator"
+        }
+      }
+    },
+    "RevocationRecord": {
+      "type": "object",
+      "description": "Signed evidence that one delegation was revoked. One record is emitted per revoked delegation. Records are immutable signed evidence: current validity is answerable from state (Delegation.revoked and ChainRegistry), never from these records alone.",
+      "required": ["delegationId", "revokedBy", "revokedAt", "reasonCode", "transactionId", "cascadeCount", "signature"],
+      "additionalProperties": false,
+      "properties": {
+        "delegationId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Delegation being revoked"
+        },
+        "revokedBy": {
+          "type": "string",
+          "description": "Authority reference (revoker key id or agent id) that performed the revocation. Corresponds to revokerKey in the cascadeRevoke algorithm."
+        },
+        "revokedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 revocation timestamp. Carried inside the signed envelope, so the timestamp is issuer-attested rather than observer-assigned."
+        },
+        "reasonCode": {
+          "type": "string",
+          "enum": ["compromised", "policy_violation", "superseded", "expired", "key_rotation", "parent_revoked", "manual"],
+          "description": "Machine-readable revocation reason. 'parent_revoked' marks a cascade-derived record (revoked because an ancestor was revoked); such records MUST set cascadeOrigin."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Optional human-readable detail accompanying reasonCode. Freetext; MUST NOT be parsed for authorization decisions."
+        },
+        "cascadeOrigin": {
+          "type": "string",
+          "format": "uuid",
+          "description": "For cascade-derived revocations, the delegationId of the root delegation whose revocation initiated this cascade. Absent on the root revocation record. Lets a validator reconstruct why a leaf died."
+        },
+        "transactionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Identifier shared by every RevocationRecord in one cascade operation and by the matching CascadeCompletionRecord. A single non-cascading revoke is a transaction of size one."
+        },
+        "evidenceRef": {
+          "type": "string",
+          "description": "Optional pointer (URI or content hash) to external evidence supporting the revocation, for dispute and compliance workflows."
+        },
+        "cascadeCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of downstream delegations also revoked as a result of this revocation (0 for a leaf)."
+        },
+        "signature": {
+          "type": "string",
+          "description": "Ed25519 signature by the revoker over the canonical-JSON serialization of this record with the signature field omitted."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["reasonCode"],
+            "properties": { "reasonCode": { "const": "parent_revoked" } }
+          },
+          "then": { "required": ["cascadeOrigin"] }
+        }
+      ]
+    },
+    "CascadeCompletionRecord": {
+      "type": "object",
+      "description": "Signed evidence that a cascade transaction closed. Emitted exactly once per transactionId, AFTER the last descendant's RevocationRecord has durably persisted. Its presence is what distinguishes 'subtree fully closed' from 'revocation in progress' using the signed records alone: RevocationRecords for a transactionId with no matching CascadeCompletionRecord MUST be read as in progress or failed, never as closed.",
+      "required": ["transactionId", "rootDelegationId", "revokedBy", "completedAt", "totalRevoked", "revokedDelegationIds", "signature"],
+      "additionalProperties": false,
+      "properties": {
+        "transactionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Matches the transactionId carried on every RevocationRecord in this cascade."
+        },
+        "rootDelegationId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "delegationId of the root delegation whose revocation initiated the cascade. Equals cascadeOrigin on the descendant records."
+        },
+        "revokedBy": {
+          "type": "string",
+          "description": "Authority reference that initiated and completed the cascade. Matches revokedBy on the root RevocationRecord."
+        },
+        "completedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp taken after the last descendant's RevocationRecord persisted. Issuer-attested inside the signed envelope."
+        },
+        "totalRevoked": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Total delegations revoked in this transaction (root plus all descendants). MUST equal the length of revokedDelegationIds."
+        },
+        "revokedDelegationIds": {
+          "type": "array",
+          "items": { "type": "string", "format": "uuid" },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Every delegationId revoked under this transactionId, including the root. Lets a validator verify the subtree is fully closed from the records alone."
+        },
+        "signature": {
+          "type": "string",
+          "description": "Ed25519 signature by the revoker over the canonical-JSON serialization of this record with the signature field omitted."
+        }
+      }
+    },
+    "RevocationEvent": {
+      "type": "object",
+      "description": "Event emitted when a delegation is revoked",
+      "required": ["delegationId", "cascadeDepth", "totalCascaded"],
+      "properties": {
+        "delegationId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "cascadeDepth": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "0 for the directly revoked delegation"
+        },
+        "totalCascaded": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Running count of all revoked in this cascade"
+        }
+      }
+    },
+    "ChainRegistry": {
+      "type": "object",
+      "description": "Tracks parent-child relationships between delegations. MUST be populated at delegation creation time.",
+      "required": ["children", "parents"],
+      "properties": {
+        "children": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "string", "format": "uuid" }
+          },
+          "description": "Maps delegationId to list of child delegationIds"
+        },
+        "parents": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string", "format": "uuid" },
+              { "type": "null" }
+            ]
+          },
+          "description": "Maps delegationId to parent delegationId (null for root)"
+        }
+      }
+    }
+  }
+}
